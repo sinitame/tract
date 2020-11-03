@@ -68,11 +68,11 @@ impl Expansion for Split {
         let mut current = 0.to_dim();
         let axis =
             if self.axis < 0 { self.axis + input.rank() as isize } else { self.axis } as usize;
-        for len in self.split_dims(&input.shape[axis])? {
+        for (idx, len) in self.split_dims(&input.shape[axis])?.iter().enumerate() {
             let end = current.clone() + len;
             outputs.push(
                 target.wire_node(
-                    format!("{}.axis_{}_{}..{}", prefix, axis, current, end),
+                    format!("{}.{}.axis_{}_{}..{}", prefix, idx, axis, current, end),
                     crate::ops::array::Slice::new(axis, current, end.clone()),
                     inputs,
                 )?[0],
