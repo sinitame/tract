@@ -11,6 +11,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v1
+    - name: cpuinfo
+      run: sysctl -a
     - name: Native script
       run: .travis/native.sh
       env:
