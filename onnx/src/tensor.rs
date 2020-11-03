@@ -38,7 +38,7 @@ impl<'a> TryFrom<&'a type_proto::Tensor> for InferenceFact {
                 .map(|d| {
                     let mut fact = DimFact::default();
                     if let Some(tensor_shape_proto::dimension::Value::DimValue(v)) = d.value {
-                        if v > 0 {
+                        if v >= 0 {
                             fact = DimFact::from(v.to_dim())
                         }
                     }
