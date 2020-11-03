@@ -14,7 +14,7 @@ fn run_set(set: &str, ver: &str) -> HashMap<String, usize> {
     if set == "real" {
         command.arg("--release");
     }
-    command.arg("--").arg("--ignored").arg(filter);
+    command.arg("--all-features").arg("--").arg("--ignored").arg(filter);
     let output = command.output().unwrap();
     let mut unexpected: HashMap<String, usize> = HashMap::default();
     for line in std::io::BufReader::new(&mut &*output.stdout).lines() {
