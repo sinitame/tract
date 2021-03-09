@@ -5,9 +5,9 @@ use tract_data::internal::*;
 
 #[derive(PartialEq, Clone, Debug, Hash)]
 pub enum MatrixStoreSpec {
-    View { axes: Option<(usize, usize)> },
+    View { axes: Option<(usize, usize)>, mr: usize, nr: usize },
     Packed { panel_bytes: usize },
-    Strides { row_byte_stride: isize, col_byte_stride: isize },
+    Strides { row_byte_stride: isize, col_byte_stride: isize, mr: usize, nr: usize },
     OffsetsAndPtrs { row_byte_offsets: Vec<isize>, col_byte_offsets: Vec<isize>, nr: usize },
     VecStride { byte_stride: isize, mr: usize, nr: usize },
 }
@@ -32,10 +32,31 @@ impl fmt::Display for MatrixStoreSpec {
 
 #[derive(Clone, Debug)]
 pub enum MatrixStore<'s, 't> {
-    Strides { ptr: *mut c_void, row_byte_stride: isize, col_byte_stride: isize, item_size: usize },
-    Packed { ptr: *const c_void, item_size: usize, panel_bytes: isize },
-    OffsetsAndPtrs { row_byte_offsets: *const isize, col_ptrs: Vec<*const c_void>, nr: usize },
-    VecStride { ptr: *const c_void, byte_stride: isize, item_size: usize },
+    Strides {
+        ptr: *mut c_void,
+        row_byte_stride: isize,
+        col_byte_stride: isize,
+        panel_row_byte_stride: isize,
+        panel_col_byte_stride: isize,
+        item_size: usize,
+        mr: usize,
+    },
+    Packed {
+        ptr: *const c_void,
+        item_size: usize,
+        panel_bytes: isize,
+    },
+    OffsetsAndPtrs {
+        row_byte_offsets: *const isize,
+        col_ptrs: Vec<*const c_void>,
+        nr: usize,
+    },
+    VecStride {
+        ptr: *const c_void,
+        byte_stride: isize,
+        panel_byte_stride: isize,
+        item_size: usize,
+    },
     _Phantom(&'s (), &'t ()),
 }
 
@@ -44,20 +65,24 @@ impl<'s, 't> MatrixStore<'s, 't> {
         use MatrixStore::*;
         use MatrixStoreSpec as S;
         match spec {
-            S::View { .. } | S::Strides { .. } => {
+            S::View { mr, nr, .. } | S::Strides { mr, nr, .. } => {
                 let (row_byte_stride, col_byte_stride) = Self::compute_strides(spec, tensor);
                 Strides {
                     ptr: tensor.as_ptr_unchecked::<u8>() as _,
                     row_byte_stride,
                     col_byte_stride,
+                    panel_row_byte_stride: row_byte_stride * *mr as isize,
+                    panel_col_byte_stride: col_byte_stride * *nr as isize,
                     item_size: tensor.datum_type().size_of(),
+                    mr: *mr,
                 }
             }
-            S::VecStride { .. } => {
+            S::VecStride { mr, .. } => {
                 let (byte_stride, _) = Self::compute_strides(spec, tensor);
                 VecStride {
                     ptr: tensor.as_ptr_unchecked::<u8>() as _,
                     byte_stride,
+                    panel_byte_stride: byte_stride * *mr as isize,
                     item_size: tensor.datum_type().size_of(),
                 }
             }
@@ -77,6 +102,7 @@ impl<'s, 't> MatrixStore<'s, 't> {
         }
     }
 
+    #[inline]
     pub(super) unsafe fn panel_a(&self, i: usize) -> PanelStore {
         match self {
             MatrixStore::Packed { ptr, panel_bytes, .. } => {
@@ -86,6 +112,7 @@ impl<'s, 't> MatrixStore<'s, 't> {
         }
     }
 
+    #[inline]
     pub(super) unsafe fn panel_b(&self, nr: usize, i: usize, n: usize) -> PanelStore {
         match self {
             MatrixStore::Packed { ptr, panel_bytes, item_size } => {
@@ -105,7 +132,7 @@ impl<'s, 't> MatrixStore<'s, 't> {
                     col_ptrs: col_ptrs.as_ptr().offset((nr * i) as isize),
                 }
             }
-            MatrixStore::VecStride { ptr, byte_stride, item_size } => PanelStore::VecStride {
+            MatrixStore::VecStride { ptr, byte_stride, item_size, .. } => PanelStore::VecStride {
                 ptr: *ptr,
                 byte_stride: *byte_stride,
                 item_size: *item_size,
@@ -116,7 +143,7 @@ impl<'s, 't> MatrixStore<'s, 't> {
 
     unsafe fn compute_strides(spec: &MatrixStoreSpec, tensor: &TensorView) -> (isize, isize) {
         match spec {
-            MatrixStoreSpec::View { axes } => {
+            MatrixStoreSpec::View { axes, .. } => {
                 let (m_axis, n_axis) = if let Some(axes) = axes {
                     axes.clone()
                 } else {
@@ -130,7 +157,7 @@ impl<'s, 't> MatrixStore<'s, 't> {
                     tensor_strides.get_unchecked(n_axis) * tensor.datum_type().size_of() as isize;
                 (row_byte_stride, col_byte_stride)
             }
-            MatrixStoreSpec::Strides { row_byte_stride, col_byte_stride } => {
+            MatrixStoreSpec::Strides { row_byte_stride, col_byte_stride, .. } => {
                 (*row_byte_stride, *col_byte_stride)
             }
             MatrixStoreSpec::VecStride { byte_stride, .. } => (*byte_stride, 0),
@@ -138,33 +165,37 @@ impl<'s, 't> MatrixStore<'s, 't> {
         }
     }
 
-    pub(super) unsafe fn tile_c(
-        &self,
-        down: usize,
-        right: usize,
-        mr: usize,
-        nr: usize,
-    ) -> PanelStore {
-        let (down, right, mr, nr) = (down as isize, right as isize, mr as isize, nr as isize);
+    #[inline]
+    pub(super) unsafe fn tile_c(&self, down: usize, right: usize) -> PanelStore {
+        let (down, right) = (down as isize, right as isize);
         match self {
-            MatrixStore::Strides { ptr, row_byte_stride, col_byte_stride, item_size, .. } => {
-                PanelStore::Strides {
-                    ptr: ptr.offset(row_byte_stride * down * mr + col_byte_stride * right * nr)
-                        as *mut _,
-                    row_byte_stride: *row_byte_stride,
-                    col_byte_stride: *col_byte_stride,
+            MatrixStore::Strides {
+                ptr,
+                row_byte_stride,
+                col_byte_stride,
+                item_size,
+                panel_row_byte_stride,
+                panel_col_byte_stride,
+                ..
+            } => PanelStore::Strides {
+                ptr: ptr.offset(panel_row_byte_stride * down + panel_col_byte_stride * right)
+                    as *mut _,
+                row_byte_stride: *row_byte_stride,
+                col_byte_stride: *col_byte_stride,
+                item_size: *item_size,
+            },
+            MatrixStore::VecStride { ptr, byte_stride, item_size, panel_byte_stride, .. } => {
+                PanelStore::VecStride {
+                    ptr: ptr.offset(panel_byte_stride * down) as *mut _,
+                    byte_stride: *byte_stride,
                     item_size: *item_size,
                 }
             }
-            MatrixStore::VecStride { ptr, byte_stride, item_size, .. } => PanelStore::VecStride {
-                ptr: ptr.offset(byte_stride * down * mr) as *mut _,
-                byte_stride: *byte_stride,
-                item_size: *item_size,
-            },
             _ => unimplemented!(),
         }
     }
 
+    #[inline]
     pub(super) unsafe fn set_from_tile<T: Datum + Copy>(
         &mut self,
         down: usize,
@@ -172,8 +203,6 @@ impl<'s, 't> MatrixStore<'s, 't> {
         height: usize,
         width: usize,
         tile: &PanelStore,
-        mr: usize,
-        nr: usize,
     ) {
         let tile = if let PanelStore::Strides { ptr, .. } = tile {
             *ptr as *mut T
@@ -181,22 +210,30 @@ impl<'s, 't> MatrixStore<'s, 't> {
             panic!("tile is expected to be in PanelStrides form")
         };
         match self {
-            MatrixStore::Strides { ptr, row_byte_stride, col_byte_stride, .. } => {
+            MatrixStore::Strides {
+                ptr,
+                row_byte_stride,
+                col_byte_stride,
+                panel_row_byte_stride,
+                panel_col_byte_stride,
+                mr,
+                ..
+            } => {
                 let dst = ptr.offset(
-                    (*row_byte_stride as usize * (down * mr)
-                        + *col_byte_stride as usize * (right * nr)) as isize,
+                    (*panel_row_byte_stride as usize * down
+                        + *panel_col_byte_stride as usize * right) as isize,
                 );
                 for y in 0..height as isize {
                     for x in 0..width as isize {
-                        let value = tile.offset(y + x * mr as isize);
+                        let value = tile.offset(y + x * *mr as isize);
                         let dst =
                             dst.offset((y * *row_byte_stride + x * *col_byte_stride) as isize);
                         *(dst as *mut T) = *value;
                     }
                 }
             }
-            MatrixStore::VecStride { ptr, byte_stride, .. } => {
-                let dst = ptr.offset(*byte_stride * (down * mr) as isize);
+            MatrixStore::VecStride { ptr, byte_stride, panel_byte_stride, .. } => {
+                let dst = ptr.offset(*panel_byte_stride * down as isize);
                 for y in 0..height as isize {
                     let value = *tile.offset(y as isize);
                     let dst = dst.offset(y as isize * *byte_stride);
